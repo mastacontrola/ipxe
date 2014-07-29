@@ -155,6 +155,7 @@ FILE_LICENCE ( GPL2_OR_LATER );
 #define ERRFILE_myson		     ( ERRFILE_DRIVER | 0x00660000 )
 #define ERRFILE_intelx		     ( ERRFILE_DRIVER | 0x00670000 )
 #define ERRFILE_snp		     ( ERRFILE_DRIVER | 0x00680000 )
+#define ERRFILE_netfront	     ( ERRFILE_DRIVER | 0x00690000 )
 
 #define ERRFILE_scsi		     ( ERRFILE_DRIVER | 0x00700000 )
 #define ERRFILE_arbel		     ( ERRFILE_DRIVER | 0x00710000 )
@@ -301,6 +302,9 @@ FILE_LICENCE ( GPL2_OR_LATER );
 #define ERRFILE_memmap_settings	      ( ERRFILE_OTHER | 0x003f0000 )
 #define ERRFILE_param_cmd	      ( ERRFILE_OTHER | 0x00400000 )
 #define ERRFILE_deflate		      ( ERRFILE_OTHER | 0x00410000 )
+#define ERRFILE_xenstore	      ( ERRFILE_OTHER | 0x00420000 )
+#define ERRFILE_xenbus		      ( ERRFILE_OTHER | 0x00430000 )
+#define ERRFILE_xengrant	      ( ERRFILE_OTHER | 0x00440000 )
 
 /** @} */
 
