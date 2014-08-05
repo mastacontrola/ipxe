@@ -34,14 +34,6 @@ FILE_LICENCE ( GPL2_OR_LATER );
 #include <ipxe/efi/efi_snp.h>
 #include <usr/autoboot.h>
 
-/** EFI simple network protocol GUID */
-static EFI_GUID efi_simple_network_protocol_guid
-	= EFI_SIMPLE_NETWORK_PROTOCOL_GUID;
-
-/** EFI device path protocol GUID */
-static EFI_GUID efi_device_path_protocol_guid
-	= EFI_DEVICE_PATH_PROTOCOL_GUID;
-
 /** EFI network interface identifier GUID */
 static EFI_GUID efi_nii_protocol_guid
 	= EFI_NETWORK_INTERFACE_IDENTIFIER_PROTOCOL_GUID;
@@ -55,14 +47,6 @@ static EFI_GUID efi_nii31_protocol_guid = {
 	0x1ACED566, 0x76ED, 0x4218,
 	{ 0xBC, 0x81, 0x76, 0x7F, 0x1F, 0x97, 0x7A, 0x89 }
 };
-
-/** EFI component name protocol GUID */
-static EFI_GUID efi_component_name2_protocol_guid
-	= EFI_COMPONENT_NAME2_PROTOCOL_GUID;
-
-/** EFI load file protocol GUID */
-static EFI_GUID efi_load_file_protocol_guid
-	= EFI_LOAD_FILE_PROTOCOL_GUID;
 
 /** List of SNP devices */
 static LIST_HEAD ( efi_snp_devices );
@@ -925,6 +909,10 @@ static int efi_snp_probe ( struct net_device *netdev ) {
 	EFI_BOOT_SERVICES *bs = efi_systab->BootServices;
 	struct efi_device *efidev;
 	struct efi_snp_device *snpdev;
+	union {
+		EFI_DEVICE_PATH_PROTOCOL *path;
+		void *interface;
+	} path;
 	EFI_DEVICE_PATH_PROTOCOL *path_end;
 	MAC_ADDR_DEVICE_PATH *macpath;
 	size_t path_prefix_len = 0;
@@ -939,14 +927,8 @@ static int efi_snp_probe ( struct net_device *netdev ) {
 		goto err_no_efidev;
 	}
 
-	/* Calculate device path prefix length */
-	path_end = efi_devpath_end ( efidev->path );
-	path_prefix_len = ( ( ( void * ) path_end ) -
-			    ( ( void * ) efidev->path ) );
-
 	/* Allocate the SNP device */
-	snpdev = zalloc ( sizeof ( *snpdev ) + path_prefix_len +
-			  sizeof ( *macpath ) );
+	snpdev = zalloc ( sizeof ( *snpdev ) );
 	if ( ! snpdev ) {
 		rc = -ENOMEM;
 		goto err_alloc_snp;
@@ -1009,9 +991,32 @@ static int efi_snp_probe ( struct net_device *netdev ) {
 				       sizeof ( snpdev->name[0] ) ),
 		       "%s", netdev->name );
 
+	/* Get the parent device path */
+	if ( ( efirc = bs->OpenProtocol ( efidev->device,
+					  &efi_device_path_protocol_guid,
+					  &path.interface, efi_image_handle,
+					  efidev->device,
+					  EFI_OPEN_PROTOCOL_GET_PROTOCOL ))!=0){
+		rc = -EEFI ( efirc );
+		DBGC ( snpdev, "SNPDEV %p cannot get %p %s device path: %s\n",
+		       snpdev, efidev->device,
+		       efi_handle_name ( efidev->device ), strerror ( rc ) );
+		goto err_open_device_path;
+	}
+
+	/* Allocate the new device path */
+	path_end = efi_devpath_end ( path.path );
+	path_prefix_len = ( ( ( void * ) path_end ) - ( ( void * ) path.path ));
+	snpdev->path = zalloc ( path_prefix_len + sizeof ( *macpath ) +
+				sizeof ( *path_end ) );
+	if ( ! snpdev->path ) {
+		rc = -ENOMEM;
+		goto err_alloc_device_path;
+	}
+
 	/* Populate the device path */
-	memcpy ( &snpdev->path, efidev->path, path_prefix_len );
-	macpath = ( ( ( void * ) &snpdev->path ) + path_prefix_len );
+	memcpy ( snpdev->path, path.path, path_prefix_len );
+	macpath = ( ( ( void * ) snpdev->path ) + path_prefix_len );
 	path_end = ( ( void * ) ( macpath + 1 ) );
 	memset ( macpath, 0, sizeof ( *macpath ) );
 	macpath->Header.Type = MESSAGING_DEVICE_PATH;
@@ -1029,7 +1034,7 @@ static int efi_snp_probe ( struct net_device *netdev ) {
 	if ( ( efirc = bs->InstallMultipleProtocolInterfaces (
 			&snpdev->handle,
 			&efi_simple_network_protocol_guid, &snpdev->snp,
-			&efi_device_path_protocol_guid, &snpdev->path,
+			&efi_device_path_protocol_guid, snpdev->path,
 			&efi_nii_protocol_guid, &snpdev->nii,
 			&efi_nii31_protocol_guid, &snpdev->nii,
 			&efi_component_name2_protocol_guid, &snpdev->name2,
@@ -1062,6 +1067,10 @@ static int efi_snp_probe ( struct net_device *netdev ) {
 	/* Add to list of SNP devices */
 	list_add ( &snpdev->list, &efi_snp_devices );
 
+	/* Close device path */
+	bs->CloseProtocol ( efidev->device, &efi_device_path_protocol_guid,
+			    efi_image_handle, efidev->device );
+
 	DBGC ( snpdev, "SNPDEV %p installed for %s as device %p %s\n",
 	       snpdev, netdev->name, snpdev->handle,
 	       efi_handle_name ( snpdev->handle ) );
@@ -1074,13 +1083,18 @@ static int efi_snp_probe ( struct net_device *netdev ) {
 	bs->UninstallMultipleProtocolInterfaces (
 			snpdev->handle,
 			&efi_simple_network_protocol_guid, &snpdev->snp,
-			&efi_device_path_protocol_guid, &snpdev->path,
+			&efi_device_path_protocol_guid, snpdev->path,
 			&efi_nii_protocol_guid, &snpdev->nii,
 			&efi_nii31_protocol_guid, &snpdev->nii,
 			&efi_component_name2_protocol_guid, &snpdev->name2,
 			&efi_load_file_protocol_guid, &snpdev->load_file,
 			NULL );
  err_install_protocol_interface:
+	free ( snpdev->path );
+ err_alloc_device_path:
+	bs->CloseProtocol ( efidev->device, &efi_device_path_protocol_guid,
+			    efi_image_handle, efidev->device );
+ err_open_device_path:
 	bs->CloseEvent ( snpdev->snp.WaitForPacket );
  err_create_event:
  err_ll_addr_len:
@@ -1140,12 +1154,13 @@ static void efi_snp_remove ( struct net_device *netdev ) {
 	bs->UninstallMultipleProtocolInterfaces (
 			snpdev->handle,
 			&efi_simple_network_protocol_guid, &snpdev->snp,
-			&efi_device_path_protocol_guid, &snpdev->path,
+			&efi_device_path_protocol_guid, snpdev->path,
 			&efi_nii_protocol_guid, &snpdev->nii,
 			&efi_nii31_protocol_guid, &snpdev->nii,
 			&efi_component_name2_protocol_guid, &snpdev->name2,
 			&efi_load_file_protocol_guid, &snpdev->load_file,
 			NULL );
+	free ( snpdev->path );
 	bs->CloseEvent ( snpdev->snp.WaitForPacket );
 	netdev_put ( snpdev->netdev );
 	free ( snpdev );

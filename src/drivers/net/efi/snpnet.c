@@ -64,14 +64,6 @@ struct snp_nic {
 /** Maximum number of received packets per poll */
 #define SNP_RX_QUOTA 4
 
-/** EFI simple network protocol GUID */
-static EFI_GUID efi_simple_network_protocol_guid
-	= EFI_SIMPLE_NETWORK_PROTOCOL_GUID;
-
-/** EFI PCI I/O protocol GUID */
-static EFI_GUID efi_pci_io_protocol_guid
-	= EFI_PCI_IO_PROTOCOL_GUID;
-
 /**
  * Format SNP MAC address (for debugging)
  *
@@ -292,6 +284,42 @@ static void snpnet_poll ( struct net_device *netdev ) {
 }
 
 /**
+ * Set receive filters
+ *
+ * @v netdev		Network device
+ * @ret rc		Return status code
+ */
+static int snpnet_rx_filters ( struct net_device *netdev ) {
+	struct snp_nic *snp = netdev->priv;
+	UINT32 filters[] = {
+		snp->snp->Mode->ReceiveFilterMask,
+		( EFI_SIMPLE_NETWORK_RECEIVE_UNICAST |
+		  EFI_SIMPLE_NETWORK_RECEIVE_MULTICAST |
+		  EFI_SIMPLE_NETWORK_RECEIVE_BROADCAST ),
+		( EFI_SIMPLE_NETWORK_RECEIVE_UNICAST |
+		  EFI_SIMPLE_NETWORK_RECEIVE_BROADCAST ),
+		( EFI_SIMPLE_NETWORK_RECEIVE_UNICAST ),
+	};
+	unsigned int i;
+	EFI_STATUS efirc;
+	int rc;
+
+	/* Try possible receive filters in turn */
+	for ( i = 0; i < ( sizeof ( filters ) / sizeof ( filters[0] ) ); i++ ) {
+		efirc = snp->snp->ReceiveFilters ( snp->snp, filters[i],
+						   0, TRUE, 0, NULL );
+		if ( efirc == 0 )
+			return 0;
+		rc = -EEFI ( efirc );
+		DBGC ( snp, "SNP %s could not set receive filters %#02x (have "
+		       "%#02x): %s\n", netdev->name, filters[i],
+		       snp->snp->Mode->ReceiveFilterSetting, strerror ( rc ) );
+	}
+
+	return rc;
+}
+
+/**
  * Open network device
  *
  * @v netdev		Network device
@@ -300,7 +328,6 @@ static void snpnet_poll ( struct net_device *netdev ) {
 static int snpnet_open ( struct net_device *netdev ) {
 	struct snp_nic *snp = netdev->priv;
 	EFI_MAC_ADDRESS *mac = ( ( void * ) netdev->ll_addr );
-	UINT32 filters;
 	EFI_STATUS efirc;
 	int rc;
 
@@ -330,16 +357,7 @@ static int snpnet_open ( struct net_device *netdev ) {
 	}
 
 	/* Set receive filters */
-	filters = ( EFI_SIMPLE_NETWORK_RECEIVE_UNICAST |
-		    EFI_SIMPLE_NETWORK_RECEIVE_MULTICAST |
-		    EFI_SIMPLE_NETWORK_RECEIVE_BROADCAST |
-		    EFI_SIMPLE_NETWORK_RECEIVE_PROMISCUOUS |
-		    EFI_SIMPLE_NETWORK_RECEIVE_PROMISCUOUS_MULTICAST );
-	if ( ( efirc = snp->snp->ReceiveFilters ( snp->snp, filters, 0, TRUE,
-						  0, NULL ) ) != 0 ) {
-		rc = -EEFI ( efirc );
-		DBGC ( snp, "SNP %s could not set receive filters: %s\n",
-		       netdev->name, strerror ( rc ) );
+	if ( ( rc = snpnet_rx_filters ( netdev ) ) != 0 ) {
 		/* Ignore error */
 	}
 
@@ -397,33 +415,56 @@ static struct net_device_operations snpnet_operations = {
  */
 static int snpnet_pci_info ( struct efi_device *efidev, struct device *dev ) {
 	EFI_BOOT_SERVICES *bs = efi_systab->BootServices;
-	EFI_DEVICE_PATH_PROTOCOL *devpath = efidev->path;
 	EFI_HANDLE device = efidev->device;
+	union {
+		EFI_DEVICE_PATH_PROTOCOL *path;
+		void *interface;
+	} path;
+	EFI_DEVICE_PATH_PROTOCOL *devpath;
 	struct pci_device pci;
 	EFI_HANDLE pci_device;
 	EFI_STATUS efirc;
 	int rc;
 
+	/* Get device path */
+	if ( ( efirc = bs->OpenProtocol ( device,
+					  &efi_device_path_protocol_guid,
+					  &path.interface,
+					  efi_image_handle, device,
+					  EFI_OPEN_PROTOCOL_GET_PROTOCOL ))!=0){
+		rc = -EEFI ( efirc );
+		DBGC ( device, "SNP %p %s cannot open device path: %s\n",
+		       device, efi_handle_name ( device ), strerror ( rc ) );
+		goto err_open_device_path;
+	}
+	devpath = path.path;
+
 	/* Check for presence of PCI I/O protocol */
 	if ( ( efirc = bs->LocateDevicePath ( &efi_pci_io_protocol_guid,
 					      &devpath, &pci_device ) ) != 0 ) {
+		rc = -EEFI ( efirc );
 		DBGC ( device, "SNP %p %s is not a PCI device\n",
 		       device, efi_handle_name ( device ) );
-		return -EEFI ( efirc );
+		goto err_locate_pci_io;
 	}
 
 	/* Get PCI device information */
 	if ( ( rc = efipci_info ( pci_device, &pci ) ) != 0 ) {
 		DBGC ( device, "SNP %p %s could not get PCI information: %s\n",
 		       device, efi_handle_name ( device ), strerror ( rc ) );
-		return rc;
+		goto err_efipci_info;
 	}
 
 	/* Populate SNP device information */
 	memcpy ( &dev->desc, &pci.dev.desc, sizeof ( dev->desc ) );
 	snprintf ( dev->name, sizeof ( dev->name ), "SNP-%s", pci.dev.name );
 
-	return 0;
+ err_efipci_info:
+ err_locate_pci_io:
+	bs->CloseProtocol ( device, &efi_device_path_protocol_guid,
+			    efi_image_handle, device );
+ err_open_device_path:
+	return rc;
 }
 
 /**
