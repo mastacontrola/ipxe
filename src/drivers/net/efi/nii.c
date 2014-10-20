@@ -28,10 +28,11 @@ FILE_LICENCE ( GPL2_OR_LATER );
 #include <ipxe/umalloc.h>
 #include <ipxe/efi/efi.h>
 #include <ipxe/efi/efi_driver.h>
-#include <ipxe/efi/efi_snp.h>
 #include <ipxe/efi/efi_pci.h>
 #include <ipxe/efi/efi_utils.h>
+#include <ipxe/efi/Protocol/NetworkInterfaceIdentifier.h>
 #include <ipxe/efi/IndustryStandard/Acpi10.h>
+#include "nii.h"
 
 /** @file
  *
@@ -956,44 +957,12 @@ static struct net_device_operations nii_operations = {
 };
 
 /**
- * Check to see if driver supports a device
- *
- * @v device		EFI device handle
- * @ret rc		Return status code
- */
-static int nii_supported ( EFI_HANDLE device ) {
-	EFI_BOOT_SERVICES *bs = efi_systab->BootServices;
-	EFI_STATUS efirc;
-
-	/* Check that this is not a device we are providing ourselves */
-	if ( find_snpdev ( device ) != NULL ) {
-		DBGCP ( device, "NII %p %s is provided by this binary\n",
-			device, efi_handle_name ( device ) );
-		return -ENOTTY;
-	}
-
-	/* Test for presence of NII protocol */
-	if ( ( efirc = bs->OpenProtocol ( device,
-					  &efi_nii31_protocol_guid,
-					  NULL, efi_image_handle, device,
-					  EFI_OPEN_PROTOCOL_TEST_PROTOCOL))!=0){
-		DBGCP ( device, "NII %p %s is not an NII device\n",
-			device, efi_handle_name ( device ) );
-		return -EEFI ( efirc );
-	}
-	DBGC ( device, "NII %p %s is an NII device\n",
-	       device, efi_handle_name ( device ) );
-
-	return 0;
-}
-
-/**
  * Attach driver to device
  *
  * @v efidev		EFI device
  * @ret rc		Return status code
  */
-static int nii_start ( struct efi_device *efidev ) {
+int nii_start ( struct efi_device *efidev ) {
 	EFI_BOOT_SERVICES *bs = efi_systab->BootServices;
 	EFI_HANDLE device = efidev->device;
 	struct net_device *netdev;
@@ -1037,6 +1006,11 @@ static int nii_start ( struct efi_device *efidev ) {
 
 	/* Locate UNDI and entry point */
 	nii->undi = ( ( void * ) ( intptr_t ) nii->nii->Id );
+	if ( ! nii->undi ) {
+		DBGC ( nii, "NII %s has no UNDI\n", nii->dev.name );
+		rc = -ENODEV;
+		goto err_no_undi;
+	}
 	if ( nii->undi->Implementation & PXE_ROMID_IMP_HW_UNDI ) {
 		DBGC ( nii, "NII %s is a mythical hardware UNDI\n",
 		       nii->dev.name );
@@ -1085,6 +1059,7 @@ static int nii_start ( struct efi_device *efidev ) {
 	nii_pci_close ( nii );
  err_pci_open:
  err_hw_undi:
+ err_no_undi:
 	bs->CloseProtocol ( device, &efi_nii31_protocol_guid,
 			    efi_image_handle, device );
  err_open_protocol:
@@ -1100,7 +1075,7 @@ static int nii_start ( struct efi_device *efidev ) {
  *
  * @v efidev		EFI device
  */
-static void nii_stop ( struct efi_device *efidev ) {
+void nii_stop ( struct efi_device *efidev ) {
 	EFI_BOOT_SERVICES *bs = efi_systab->BootServices;
 	struct net_device *netdev = efidev_get_drvdata ( efidev );
 	struct nii_nic *nii = netdev->priv;
@@ -1124,11 +1099,3 @@ static void nii_stop ( struct efi_device *efidev ) {
 	netdev_nullify ( netdev );
 	netdev_put ( netdev );
 }
-
-/** EFI NII driver */
-struct efi_driver nii_driver __efi_driver ( EFI_DRIVER_NORMAL ) = {
-	.name = "NII",
-	.supported = nii_supported,
-	.start = nii_start,
-	.stop = nii_stop,
-};
