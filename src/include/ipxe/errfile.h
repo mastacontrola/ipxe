@@ -157,6 +157,7 @@ FILE_LICENCE ( GPL2_OR_LATER );
 #define ERRFILE_snp		     ( ERRFILE_DRIVER | 0x00680000 )
 #define ERRFILE_netfront	     ( ERRFILE_DRIVER | 0x00690000 )
 #define ERRFILE_nii		     ( ERRFILE_DRIVER | 0x006a0000 )
+#define ERRFILE_netvsc		     ( ERRFILE_DRIVER | 0x006b0000 )
 
 #define ERRFILE_scsi		     ( ERRFILE_DRIVER | 0x00700000 )
 #define ERRFILE_arbel		     ( ERRFILE_DRIVER | 0x00710000 )
@@ -227,6 +228,7 @@ FILE_LICENCE ( GPL2_OR_LATER );
 #define ERRFILE_ping			( ERRFILE_NET | 0x003a0000 )
 #define ERRFILE_dhcpv6			( ERRFILE_NET | 0x003b0000 )
 #define ERRFILE_nfs_uri			( ERRFILE_NET | 0x003c0000 )
+#define ERRFILE_rndis			( ERRFILE_NET | 0x003d0000 )
 
 #define ERRFILE_image		      ( ERRFILE_IMAGE | 0x00000000 )
 #define ERRFILE_elf		      ( ERRFILE_IMAGE | 0x00010000 )
@@ -308,6 +310,7 @@ FILE_LICENCE ( GPL2_OR_LATER );
 #define ERRFILE_xengrant	      ( ERRFILE_OTHER | 0x00440000 )
 #define ERRFILE_efi_utils	      ( ERRFILE_OTHER | 0x00450000 )
 #define ERRFILE_efi_wrap	      ( ERRFILE_OTHER | 0x00460000 )
+#define ERRFILE_vmbus		      ( ERRFILE_OTHER | 0x00470000 )
 
 /** @} */
 
