@@ -27,6 +27,7 @@ FILE_LICENCE ( GPL2_OR_LATER );
 #include <assert.h>
 #include <byteswap.h>
 #include <ipxe/usb.h>
+#include <ipxe/cdc.h>
 
 /** @file
  *
@@ -226,10 +227,13 @@ int usb_endpoint_described ( struct usb_endpoint *ep,
 			     struct usb_configuration_descriptor *config,
 			     struct usb_interface_descriptor *interface,
 			     unsigned int type, unsigned int index ) {
+	struct usb_device *usb = ep->usb;
+	struct usb_port *port = usb->port;
 	struct usb_endpoint_descriptor *desc;
 	struct usb_endpoint_companion_descriptor *descx;
 	unsigned int sizes;
 	unsigned int burst;
+	unsigned int interval;
 	size_t mtu;
 
 	/* Locate endpoint descriptor */
@@ -245,9 +249,23 @@ int usb_endpoint_described ( struct usb_endpoint *ep,
 	mtu = USB_ENDPOINT_MTU ( sizes );
 	burst = ( descx ? descx->burst : USB_ENDPOINT_BURST ( sizes ) );
 
+	/* Calculate interval */
+	if ( type == USB_INTERRUPT ) {
+		if ( port->speed >= USB_SPEED_HIGH ) {
+			/* 2^(desc->interval-1) is a microframe count */
+			interval = ( 1 << ( desc->interval - 1 ) );
+		} else {
+			/* desc->interval is a (whole) frame count */
+			interval = ( desc->interval << 3 );
+		}
+	} else {
+		/* desc->interval is a microframe count */
+		interval = desc->interval;
+	}
+
 	/* Describe endpoint */
 	usb_endpoint_describe ( ep, desc->endpoint, desc->attributes,
-				mtu, burst );
+				mtu, burst, interval );
 	return 0;
 }
 
@@ -285,8 +303,9 @@ int usb_endpoint_open ( struct usb_endpoint *ep ) {
 	}
 	ep->open = 1;
 
-	DBGC2 ( usb, "USB %s %s opened with MTU %zd (burst %d)\n", usb->name,
-		usb_endpoint_name ( ep->address ), ep->mtu, ep->burst );
+	DBGC2 ( usb, "USB %s %s opened with MTU %zd, burst %d, interval %d\n",
+		usb->name, usb_endpoint_name ( ep->address ), ep->mtu,
+		ep->burst, ep->interval );
 	return 0;
 
 	ep->open = 0;
@@ -678,6 +697,7 @@ static int usb_function ( struct usb_function *func,
 	struct usb_device *usb = func->usb;
 	struct usb_interface_association_descriptor *association;
 	struct usb_interface_descriptor *interface;
+	struct cdc_union_descriptor *cdc_union;
 	unsigned int i;
 
 	/* First, look for an interface association descriptor */
@@ -685,8 +705,7 @@ static int usb_function ( struct usb_function *func,
 	if ( association ) {
 
 		/* Sanity check */
-		if ( ( association->first + association->count ) >
-		     config->interfaces ) {
+		if ( association->count > config->interfaces ) {
 			DBGC ( usb, "USB %s has invalid association [%d-%d)\n",
 			       func->name, association->first,
 			       ( association->first + association->count ) );
@@ -714,6 +733,30 @@ static int usb_function ( struct usb_function *func,
 	memcpy ( &func->class, &interface->class, sizeof ( func->class ) );
 	func->count = 1;
 	func->interface[0] = first;
+
+	/* Look for a CDC union descriptor, if applicable */
+	if ( ( func->class.class == USB_CLASS_CDC ) &&
+	     ( cdc_union = cdc_union_descriptor ( config, interface ) ) ) {
+
+		/* Determine interface count */
+		func->count = ( ( cdc_union->header.len -
+				  offsetof ( typeof ( *cdc_union ),
+					     interface[0] ) ) /
+				sizeof ( cdc_union->interface[0] ) );
+		if ( func->count > config->interfaces ) {
+			DBGC ( usb, "USB %s has invalid union functional "
+			       "descriptor with %d interfaces\n",
+			       func->name, func->count );
+			return -ERANGE;
+		}
+
+		/* Describe function */
+		for ( i = 0 ; i < func->count ; i++ )
+			func->interface[i] = cdc_union->interface[i];
+
+		return 0;
+	}
+
 	return 0;
 }
 
@@ -831,7 +874,7 @@ usb_probe_all ( struct usb_device *usb,
 		func->dev.desc.vendor = le16_to_cpu ( usb->device.vendor );
 		func->dev.desc.device = le16_to_cpu ( usb->device.product );
 		snprintf ( func->dev.name, sizeof ( func->dev.name ),
-			   "%s-%d", usb->name, first );
+			   "%s-%d.%d", usb->name, config->config, first );
 		INIT_LIST_HEAD ( &func->dev.children );
 		func->dev.parent = bus->dev;
 
@@ -842,7 +885,11 @@ usb_probe_all ( struct usb_device *usb,
 
 		/* Mark interfaces as used */
 		for ( i = 0 ; i < func->count ; i++ ) {
-			assert ( func->interface[i] < config->interfaces );
+			if ( func->interface[i] >= config->interfaces ) {
+				DBGC ( usb, "USB %s has invalid interface %d\n",
+				       func->name, func->interface[i] );
+				goto err_interface;
+			}
 			used[ func->interface[i] ] = 1;
 		}
 
@@ -872,6 +919,7 @@ usb_probe_all ( struct usb_device *usb,
 	err_probe:
 		free ( func );
 	err_alloc:
+	err_interface:
 	err_function:
 		/* Continue registering other functions */
 		continue;
@@ -903,6 +951,133 @@ static void usb_remove_all ( struct usb_device *usb ) {
 		/* Free function */
 		free ( func );
 	}
+}
+
+/**
+ * Select USB device configuration
+ *
+ * @v usb		USB device
+ * @v index		Configuration index
+ * @ret rc		Return status code
+ */
+static int usb_configure ( struct usb_device *usb, unsigned int index ) {
+	struct usb_configuration_descriptor partial;
+	struct usb_configuration_descriptor *config;
+	size_t len;
+	int rc;
+
+	/* Read first part of configuration descriptor to get size */
+	if ( ( rc = usb_get_config_descriptor ( usb, index, &partial,
+						sizeof ( partial ) ) ) != 0 ) {
+		DBGC ( usb, "USB %s could not get configuration descriptor %d: "
+		       "%s\n", usb->name, index, strerror ( rc ) );
+		goto err_get_partial;
+	}
+	len = le16_to_cpu ( partial.len );
+	if ( len < sizeof ( partial ) ) {
+		DBGC ( usb, "USB %s underlength configuraton descriptor %d\n",
+		       usb->name, index );
+		rc = -EINVAL;
+		goto err_partial_len;
+	}
+
+	/* Allocate buffer for whole configuration descriptor */
+	config = malloc ( len );
+	if ( ! config ) {
+		rc = -ENOMEM;
+		goto err_alloc_config;
+	}
+
+	/* Read whole configuration descriptor */
+	if ( ( rc = usb_get_config_descriptor ( usb, index, config,
+						len ) ) != 0 ) {
+		DBGC ( usb, "USB %s could not get configuration descriptor %d: "
+		       "%s\n", usb->name, index, strerror ( rc ) );
+		goto err_get_config_descriptor;
+	}
+	if ( config->len != partial.len ) {
+		DBGC ( usb, "USB %s bad configuration descriptor %d length\n",
+		       usb->name, index );
+		rc = -EINVAL;
+		goto err_config_len;
+	}
+
+	/* Set configuration */
+	if ( ( rc = usb_set_configuration ( usb, config->config ) ) != 0){
+		DBGC ( usb, "USB %s could not set configuration %d: %s\n",
+		       usb->name, config->config, strerror ( rc ) );
+		goto err_set_configuration;
+	}
+
+	/* Probe USB device drivers */
+	usb_probe_all ( usb, config );
+
+	/* Free configuration descriptor */
+	free ( config );
+
+	return 0;
+
+	usb_remove_all ( usb );
+	usb_set_configuration ( usb, 0 );
+ err_set_configuration:
+ err_config_len:
+ err_get_config_descriptor:
+	free ( config );
+ err_alloc_config:
+ err_partial_len:
+ err_get_partial:
+	return rc;
+}
+
+/**
+ * Clear USB device configuration
+ *
+ * @v usb		USB device
+ */
+static void usb_deconfigure ( struct usb_device *usb ) {
+	unsigned int i;
+
+	/* Remove device drivers */
+	usb_remove_all ( usb );
+
+	/* Sanity checks */
+	for ( i = 0 ; i < ( sizeof ( usb->ep ) / sizeof ( usb->ep[0] ) ) ; i++){
+		if ( i != USB_ENDPOINT_IDX ( USB_EP0_ADDRESS ) )
+			assert ( usb->ep[i] == NULL );
+	}
+
+	/* Clear device configuration */
+	usb_set_configuration ( usb, 0 );
+}
+
+/**
+ * Find and select a supported USB device configuration
+ *
+ * @v usb		USB device
+ * @ret rc		Return status code
+ */
+static int usb_configure_any ( struct usb_device *usb ) {
+	unsigned int index;
+	int rc = -ENOENT;
+
+	/* Attempt all configuration indexes */
+	for ( index = 0 ; index < usb->device.configurations ; index++ ) {
+
+		/* Attempt this configuration index */
+		if ( ( rc = usb_configure ( usb, index ) ) != 0 )
+			continue;
+
+		/* If we have no drivers, then try the next configuration */
+		if ( list_empty ( &usb->functions ) ) {
+			rc = -ENOTSUP;
+			usb_deconfigure ( usb );
+			continue;
+		}
+
+		return 0;
+	}
+
+	return rc;
 }
 
 /******************************************************************************
@@ -948,11 +1123,8 @@ static int register_usb ( struct usb_device *usb ) {
 	struct usb_port *port = usb->port;
 	struct usb_hub *hub = port->hub;
 	struct usb_bus *bus = hub->bus;
-	struct usb_configuration_descriptor partial;
-	struct usb_configuration_descriptor *config;
 	unsigned int protocol;
 	size_t mtu;
-	size_t len;
 	int rc;
 
 	/* Add to port */
@@ -993,7 +1165,8 @@ static int register_usb ( struct usb_device *usb ) {
 	/* Describe control endpoint */
 	mtu = USB_EP0_DEFAULT_MTU ( port->speed );
 	usb_endpoint_describe ( &usb->control, USB_EP0_ADDRESS,
-				USB_EP0_ATTRIBUTES, mtu, USB_EP0_BURST );
+				USB_EP0_ATTRIBUTES, mtu, USB_EP0_BURST,
+				USB_EP0_INTERVAL );
 
 	/* Open control endpoint */
 	if ( ( rc = usb_endpoint_open ( &usb->control ) ) != 0 )
@@ -1040,65 +1213,14 @@ static int register_usb ( struct usb_device *usb ) {
 	       usb_bcd ( le16_to_cpu ( usb->device.protocol ) ),
 	       usb_speed_name ( port->speed ), usb->control.mtu );
 
-	/* Read first part of configuration descriptor to get size */
-	if ( ( rc = usb_get_config_descriptor ( usb, 0, &partial,
-						sizeof ( partial ) ) ) != 0 ) {
-		DBGC ( usb, "USB %s could not get configuration descriptor: "
-		       "%s\n", usb->name, strerror ( rc ) );
-		goto err_get_partial;
-	}
-	len = le16_to_cpu ( partial.len );
-	if ( len < sizeof ( partial ) ) {
-		DBGC ( usb, "USB %s underlength configuraton descriptor\n",
-		       usb->name );
-		rc = -EINVAL;
-		goto err_partial_len;
-	}
-
-	/* Allocate buffer for whole configuration descriptor */
-	config = malloc ( len );
-	if ( ! config ) {
-		rc = -ENOMEM;
-		goto err_alloc_config;
-	}
-
-	/* Read whole configuration descriptor */
-	if ( ( rc = usb_get_config_descriptor ( usb, 0, config, len ) ) != 0 ) {
-		DBGC ( usb, "USB %s could not get configuration descriptor: "
-		       "%s\n", usb->name, strerror ( rc ) );
-		goto err_get_config_descriptor;
-	}
-	if ( config->len != partial.len ) {
-		DBGC ( usb, "USB %s bad configuration descriptor length\n",
-		       usb->name );
-		rc = -EINVAL;
-		goto err_config_len;
-	}
-
-	/* Set configuration */
-	if ( ( rc = usb_set_configuration ( usb, config->config ) ) != 0){
-		DBGC ( usb, "USB %s could not set configuration %#02x: %s\n",
-		       usb->name, config->config, strerror ( rc ) );
-		goto err_set_configuration;
-	}
-
-	/* Probe USB device drivers */
-	usb_probe_all ( usb, config );
-
-	/* Free configuration descriptor */
-	free ( config );
+	/* Configure device */
+	if ( ( rc = usb_configure_any ( usb ) ) != 0 )
+		goto err_configure_any;
 
 	return 0;
 
-	usb_remove_all ( usb );
-	usb_set_configuration ( usb, 0 );
- err_set_configuration:
- err_config_len:
- err_get_config_descriptor:
-	free ( config );
- err_alloc_config:
- err_partial_len:
- err_get_partial:
+	usb_deconfigure ( usb );
+ err_configure_any:
  err_get_device_descriptor:
  err_mtu:
  err_get_mtu:
@@ -1126,20 +1248,12 @@ static void unregister_usb ( struct usb_device *usb ) {
 	struct usb_hub *hub = port->hub;
 	struct io_buffer *iobuf;
 	struct io_buffer *tmp;
-	unsigned int i;
-
-	/* Remove device drivers */
-	usb_remove_all ( usb );
 
 	/* Sanity checks */
-	for ( i = 0 ; i < ( sizeof ( usb->ep ) / sizeof ( usb->ep[0] ) ) ; i++){
-		if ( i != USB_ENDPOINT_IDX ( USB_EP0_ADDRESS ) )
-			assert ( usb->ep[i] == NULL );
-	}
 	assert ( port->usb == usb );
 
 	/* Clear device configuration */
-	usb_set_configuration ( usb, 0 );
+	usb_deconfigure ( usb );
 
 	/* Close control endpoint */
 	usb_endpoint_close ( &usb->control );
