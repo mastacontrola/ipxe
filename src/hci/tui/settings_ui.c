@@ -30,6 +30,7 @@ FILE_LICENCE ( GPL2_OR_LATER );
 #include <ipxe/keys.h>
 #include <ipxe/ansicol.h>
 #include <ipxe/settings_ui.h>
+#include <config/branding.h>
 
 /** @file
  *
@@ -348,7 +349,7 @@ static void draw_title_row ( struct setting_widget *widget ) {
 	clearmsg ( TITLE_ROW );
 	name = settings_name ( widget->settings );
 	attron ( A_BOLD );
-	msg ( TITLE_ROW, "iPXE configuration settings%s%s",
+	msg ( TITLE_ROW, PRODUCT_SHORT_NAME " configuration settings%s%s",
 	      ( name[0] ? " - " : "" ), name );
 	attroff ( A_BOLD );
 }
@@ -377,8 +378,7 @@ static void draw_info_row ( struct setting_widget *widget ) {
 	msg ( INFO_ROW, "%s - %s", buf, widget->row.setting.description );
 	attroff ( A_BOLD );
 	color_set ( CPAIR_URL, NULL );
-	msg ( ( INFO_ROW + 1 ), "http://ipxe.org/cfg/%s",
-	      widget->row.setting.name );
+	msg ( ( INFO_ROW + 1 ), PRODUCT_SETTING_URI, widget->row.setting.name );
 	color_set ( CPAIR_NORMAL, NULL );
 }
 

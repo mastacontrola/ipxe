@@ -42,6 +42,7 @@ FILE_LICENCE ( GPL2_OR_LATER );
 #include <usr/prompt.h>
 #include <usr/autoboot.h>
 #include <config/general.h>
+#include <config/branding.h>
 
 /** @file
  *
@@ -522,7 +523,8 @@ static int shell_banner ( void ) {
 
 	/* Prompt user */
 	printf ( "\n" );
-	return ( prompt ( "Press Ctrl-B for the iPXE command line...",
+	return ( prompt ( "Press Ctrl-B for the " PRODUCT_SHORT_NAME
+			  " command line...",
 			  ( ( BANNER_TIMEOUT * TICKS_PER_SEC ) / 10 ),
 			  CTRL_B ) == 0 );
 }
@@ -542,17 +544,16 @@ void ipxe ( struct net_device *netdev ) {
 	 *
 	 *
 	 * If you wish to brand this build of iPXE, please do so by
-	 * defining the string PRODUCT_NAME in config/general.h.
+	 * defining the string PRODUCT_NAME in config/branding.h.
 	 *
 	 * While nothing in the GPL prevents you from removing all
 	 * references to iPXE or http://ipxe.org, we prefer you not to
 	 * do so.
 	 *
 	 */
-	printf ( NORMAL "\n\n%s\n" BOLD "iPXE %s"
-		 NORMAL " -- Open Source Network Boot Firmware -- "
-		 CYAN "http://ipxe.org" NORMAL "\n"
-		 "Features:", product_name, product_version );
+	printf ( NORMAL "\n\n" PRODUCT_NAME "\n" BOLD PRODUCT_SHORT_NAME " %s"
+		 NORMAL " -- " PRODUCT_TAG_LINE " -- "
+		 CYAN PRODUCT_URI NORMAL "\nFeatures:", product_version );
 	for_each_table_entry ( feature, FEATURES )
 		printf ( " %s", feature->name );
 	printf ( "\n" );
