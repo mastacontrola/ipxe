@@ -239,5 +239,11 @@ struct net_device * alloc_etherdev ( size_t priv_size ) {
 	return netdev;
 }
 
+/* Drag in objects via ethernet_protocol */
+REQUIRING_SYMBOL ( ethernet_protocol );
+
+/* Drag in Ethernet configuration */
+REQUIRE_OBJECT ( config_ethernet );
+
 /* Drag in Ethernet slow protocols */
 REQUIRE_OBJECT ( eth_slow );
