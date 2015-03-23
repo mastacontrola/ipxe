@@ -296,9 +296,7 @@ int usb_endpoint_open ( struct usb_endpoint *ep ) {
 		goto err_already;
 	}
 	usb->ep[idx] = ep;
-
-	/* Clear any stale error status */
-	ep->rc = 0;
+	INIT_LIST_HEAD ( &ep->halted );
 
 	/* Open endpoint */
 	if ( ( rc = ep->host->open ( ep ) ) != 0 ) {
@@ -324,6 +322,37 @@ int usb_endpoint_open ( struct usb_endpoint *ep ) {
 }
 
 /**
+ * Clear transaction translator (if applicable)
+ *
+ * @v ep		USB endpoint
+ * @ret rc		Return status code
+ */
+static int usb_endpoint_clear_tt ( struct usb_endpoint *ep ) {
+	struct usb_device *usb = ep->usb;
+	struct usb_port *tt;
+	int rc;
+
+	/* Do nothing if this is a periodic endpoint */
+	if ( ep->attributes & USB_ENDPOINT_ATTR_PERIODIC )
+		return 0;
+
+	/* Do nothing if this endpoint is not behind a transaction translator */
+	tt = usb_transaction_translator ( usb );
+	if ( ! tt )
+		return 0;
+
+	/* Clear transaction translator buffer */
+	if ( ( rc = tt->hub->driver->clear_tt ( tt->hub, tt, ep ) ) != 0 ) {
+		DBGC ( usb, "USB %s %s could not clear transaction translator: "
+		       "%s\n", usb->name, usb_endpoint_name ( ep->address ),
+		       strerror ( rc ) );
+		return rc;
+	}
+
+	return 0;
+}
+
+/**
  * Close USB endpoint
  *
  * @v ep		USB endpoint
@@ -342,10 +371,14 @@ void usb_endpoint_close ( struct usb_endpoint *ep ) {
 
 	/* Remove from endpoint list */
 	usb->ep[idx] = NULL;
+	list_del ( &ep->halted );
 
 	/* Discard any recycled buffers, if applicable */
 	if ( ep->max )
 		usb_flush ( ep );
+
+	/* Clear transaction translator, if applicable */
+	usb_endpoint_clear_tt ( ep );
 }
 
 /**
@@ -359,6 +392,9 @@ static int usb_endpoint_reset ( struct usb_endpoint *ep ) {
 	unsigned int type;
 	int rc;
 
+	/* Sanity check */
+	assert ( ! list_empty ( &ep->halted ) );
+
 	/* Reset endpoint */
 	if ( ( rc = ep->host->reset ( ep ) ) != 0 ) {
 		DBGC ( usb, "USB %s %s could not reset: %s\n",
@@ -366,6 +402,10 @@ static int usb_endpoint_reset ( struct usb_endpoint *ep ) {
 		       strerror ( rc ) );
 		return rc;
 	}
+
+	/* Clear transaction translator, if applicable */
+	if ( ( rc = usb_endpoint_clear_tt ( ep ) ) != 0 )
+		return rc;
 
 	/* Clear endpoint halt, if applicable */
 	type = ( ep->attributes & USB_ENDPOINT_ATTR_TYPE_MASK );
@@ -379,8 +419,9 @@ static int usb_endpoint_reset ( struct usb_endpoint *ep ) {
 		return rc;
 	}
 
-	/* Clear recorded error */
-	ep->rc = 0;
+	/* Remove from list of halted endpoints */
+	list_del ( &ep->halted );
+	INIT_LIST_HEAD ( &ep->halted );
 
 	DBGC ( usb, "USB %s %s reset\n",
 	       usb->name, usb_endpoint_name ( ep->address ) );
@@ -434,7 +475,8 @@ int usb_message ( struct usb_endpoint *ep, unsigned int request,
 		return -ENODEV;
 
 	/* Reset endpoint if required */
-	if ( ( ep->rc != 0 ) && ( ( rc = usb_endpoint_reset ( ep ) ) != 0 ) )
+	if ( ( ! list_empty ( &ep->halted ) ) &&
+	     ( ( rc = usb_endpoint_reset ( ep ) ) != 0 ) )
 		return rc;
 
 	/* Zero input data buffer (if applicable) */
@@ -480,7 +522,8 @@ int usb_stream ( struct usb_endpoint *ep, struct io_buffer *iobuf,
 		return -ENODEV;
 
 	/* Reset endpoint if required */
-	if ( ( ep->rc != 0 ) && ( ( rc = usb_endpoint_reset ( ep ) ) != 0 ) )
+	if ( ( ! list_empty ( &ep->halted ) ) &&
+	     ( ( rc = usb_endpoint_reset ( ep ) ) != 0 ) )
 		return rc;
 
 	/* Enqueue stream transfer */
@@ -507,17 +550,19 @@ int usb_stream ( struct usb_endpoint *ep, struct io_buffer *iobuf,
 void usb_complete_err ( struct usb_endpoint *ep, struct io_buffer *iobuf,
 			int rc ) {
 	struct usb_device *usb = ep->usb;
+	struct usb_bus *bus = usb->port->hub->bus;
 
 	/* Decrement fill level */
 	assert ( ep->fill > 0 );
 	ep->fill--;
 
-	/* Record error (if any) */
-	ep->rc = rc;
+	/* Schedule reset, if applicable */
 	if ( ( rc != 0 ) && ep->open ) {
 		DBGC ( usb, "USB %s %s completion failed: %s\n",
 		       usb->name, usb_endpoint_name ( ep->address ),
 		       strerror ( rc ) );
+		list_del ( &ep->halted );
+		list_add_tail ( &ep->halted, &bus->halted );
 	}
 
 	/* Report completion */
@@ -642,6 +687,12 @@ void usb_flush ( struct usb_endpoint *ep ) {
  ******************************************************************************
  */
 
+/** USB control transfer pseudo-header */
+struct usb_control_pseudo_header {
+	/** Completion status */
+	int rc;
+};
+
 /**
  * Complete USB control transfer
  *
@@ -652,13 +703,14 @@ void usb_flush ( struct usb_endpoint *ep ) {
 static void usb_control_complete ( struct usb_endpoint *ep,
 				   struct io_buffer *iobuf, int rc ) {
 	struct usb_device *usb = ep->usb;
+	struct usb_control_pseudo_header *pshdr;
 
-	/* Check for failures */
+	/* Record completion status in buffer */
+	pshdr = iob_push ( iobuf, sizeof ( *pshdr ) );
+	pshdr->rc = rc;
 	if ( rc != 0 ) {
 		DBGC ( usb, "USB %s control transaction failed: %s\n",
 		       usb->name, strerror ( rc ) );
-		free_iob ( iobuf );
-		return;
 	}
 
 	/* Add to list of completed I/O buffers */
@@ -686,17 +738,19 @@ int usb_control ( struct usb_device *usb, unsigned int request,
 		  size_t len ) {
 	struct usb_bus *bus = usb->port->hub->bus;
 	struct usb_endpoint *ep = &usb->control;
+	struct usb_control_pseudo_header *pshdr;
 	struct io_buffer *iobuf;
 	struct io_buffer *cmplt;
 	unsigned int i;
 	int rc;
 
 	/* Allocate I/O buffer */
-	iobuf = alloc_iob ( len );
+	iobuf = alloc_iob ( sizeof ( *pshdr ) + len );
 	if ( ! iobuf ) {
 		rc = -ENOMEM;
 		goto err_alloc;
 	}
+	iob_reserve ( iobuf, sizeof ( *pshdr ) );
 	iob_put ( iobuf, len );
 	if ( request & USB_DIR_IN ) {
 		memset ( data, 0, len );
@@ -722,14 +776,25 @@ int usb_control ( struct usb_device *usb, unsigned int request,
 			/* Remove from completion list */
 			list_del ( &cmplt->list );
 
+			/* Extract and strip completion status */
+			pshdr = cmplt->data;
+			iob_pull ( cmplt, sizeof ( *pshdr ) );
+			rc = pshdr->rc;
+
 			/* Discard stale completions */
 			if ( cmplt != iobuf ) {
-				DBGC ( usb, "USB %s stale control "
-				       "completion:\n", usb->name );
+				DBGC ( usb, "USB %s stale control completion: "
+				       "%s\n", usb->name, strerror ( rc ) );
 				DBGC_HDA ( usb, 0, cmplt->data,
 					   iob_len ( cmplt ) );
 				free_iob ( cmplt );
 				continue;
+			}
+
+			/* Fail immediately if completion was in error */
+			if ( rc != 0 ) {
+				free_iob ( cmplt );
+				return rc;
 			}
 
 			/* Copy completion to data buffer, if applicable */
@@ -739,10 +804,6 @@ int usb_control ( struct usb_device *usb, unsigned int request,
 			free_iob ( cmplt );
 			return 0;
 		}
-
-		/* Fail immediately if endpoint is in an error state */
-		if ( ep->rc )
-			return ep->rc;
 
 		/* Delay */
 		mdelay ( 1 );
@@ -1549,8 +1610,8 @@ void usb_port_changed ( struct usb_port *port ) {
 	struct usb_bus *bus = hub->bus;
 
 	/* Record hub port status change */
-	list_del ( &port->list );
-	list_add_tail ( &port->list, &bus->changed );
+	list_del ( &port->changed );
+	list_add_tail ( &port->changed, &bus->changed );
 }
 
 /**
@@ -1559,10 +1620,21 @@ void usb_port_changed ( struct usb_port *port ) {
  * @v bus		USB bus
  */
 static void usb_step ( struct usb_bus *bus ) {
+	struct usb_endpoint *ep;
 	struct usb_port *port;
 
 	/* Poll bus */
 	usb_poll ( bus );
+
+	/* Attempt to reset first halted endpoint in list, if any.  We
+	 * do not attempt to process the complete list, since this
+	 * would require extra code to allow for the facts that the
+	 * halted endpoint list may change as we do so, and that
+	 * resetting an endpoint may fail.
+	 */
+	if ( ( ep = list_first_entry ( &bus->halted, struct usb_endpoint,
+				       halted ) ) != NULL )
+		usb_endpoint_reset ( ep );
 
 	/* Handle any changed ports, allowing for the fact that the
 	 * port list may change as we perform hotplug actions.
@@ -1570,12 +1642,13 @@ static void usb_step ( struct usb_bus *bus ) {
 	while ( ! list_empty ( &bus->changed ) ) {
 
 		/* Get first changed port */
-		port = list_first_entry ( &bus->changed, struct usb_port, list);
+		port = list_first_entry ( &bus->changed, struct usb_port,
+					  changed );
 		assert ( port != NULL );
 
 		/* Remove from list of changed ports */
-		list_del ( &port->list );
-		INIT_LIST_HEAD ( &port->list );
+		list_del ( &port->changed );
+		INIT_LIST_HEAD ( &port->changed );
 
 		/* Perform appropriate hotplug action */
 		usb_hotplug ( port );
@@ -1628,7 +1701,7 @@ struct usb_hub * alloc_usb_hub ( struct usb_bus *bus, struct usb_device *usb,
 		port->address = i;
 		if ( usb )
 			port->protocol = usb->port->protocol;
-		INIT_LIST_HEAD ( &port->list );
+		INIT_LIST_HEAD ( &port->changed );
 	}
 
 	return hub;
@@ -1702,8 +1775,8 @@ void unregister_usb_hub ( struct usb_hub *hub ) {
 	/* Cancel any pending port status changes */
 	for ( i = 1 ; i <= hub->ports ; i++ ) {
 		port = usb_port ( hub, i );
-		list_del ( &port->list );
-		INIT_LIST_HEAD ( &port->list );
+		list_del ( &port->changed );
+		INIT_LIST_HEAD ( &port->changed );
 	}
 
 	/* Remove from hub list */
@@ -1724,7 +1797,7 @@ void free_usb_hub ( struct usb_hub *hub ) {
 		port = usb_port ( hub, i );
 		assert ( ! port->attached );
 		assert ( port->usb == NULL );
-		assert ( list_empty ( &port->list ) );
+		assert ( list_empty ( &port->changed ) );
 	}
 
 	/* Free hub */
@@ -1762,6 +1835,7 @@ struct usb_bus * alloc_usb_bus ( struct device *dev, unsigned int ports,
 	INIT_LIST_HEAD ( &bus->devices );
 	INIT_LIST_HEAD ( &bus->hubs );
 	INIT_LIST_HEAD ( &bus->changed );
+	INIT_LIST_HEAD ( &bus->halted );
 	process_init_stopped ( &bus->process, &usb_process_desc, NULL );
 	bus->host = &bus->op->bus;
 
@@ -1913,14 +1987,16 @@ void usb_free_address ( struct usb_bus *bus, unsigned int address ) {
  * @ret route		USB route string
  */
 unsigned int usb_route_string ( struct usb_device *usb ) {
+	struct usb_device *parent;
 	unsigned int route;
 
 	/* Navigate up to root hub, constructing route string as we go */
-	for ( route = 0 ; usb->port->hub->usb ; usb = usb->port->hub->usb ) {
+	for ( route = 0 ; ( parent = usb->port->hub->usb ) ; usb = parent ) {
 		route <<= 4;
 		route |= ( ( usb->port->address > 0xf ) ?
 			   0xf : usb->port->address );
 	}
+
 	return route;
 }
 
@@ -1931,10 +2007,11 @@ unsigned int usb_route_string ( struct usb_device *usb ) {
  * @ret depth		Hub depth
  */
 unsigned int usb_depth ( struct usb_device *usb ) {
+	struct usb_device *parent;
 	unsigned int depth;
 
 	/* Navigate up to root hub, constructing depth as we go */
-	for ( depth = 0 ; usb->port->hub->usb ; usb = usb->port->hub->usb )
+	for ( depth = 0 ; ( parent = usb->port->hub->usb ) ; usb = parent )
 		depth++;
 
 	return depth;
@@ -1947,12 +2024,35 @@ unsigned int usb_depth ( struct usb_device *usb ) {
  * @ret port		Root hub port
  */
 struct usb_port * usb_root_hub_port ( struct usb_device *usb ) {
+	struct usb_device *parent;
 
 	/* Navigate up to root hub */
-	while ( usb->port->hub->usb )
-		usb = usb->port->hub->usb;
+	while ( ( parent = usb->port->hub->usb ) )
+		usb = parent;
 
 	return usb->port;
+}
+
+/**
+ * Get USB transaction translator
+ *
+ * @v usb		USB device
+ * @ret port		Transaction translator port, or NULL
+ */
+struct usb_port * usb_transaction_translator ( struct usb_device *usb ) {
+	struct usb_device *parent;
+
+	/* Navigate up to root hub.  If we find a low-speed or
+	 * full-speed port with a higher-speed parent device, then
+	 * that port is the transaction translator.
+	 */
+	for ( ; ( parent = usb->port->hub->usb ) ; usb = parent ) {
+		if ( ( usb->port->speed <= USB_SPEED_FULL ) &&
+		     ( parent->port->speed > USB_SPEED_FULL ) )
+			return usb->port;
+	}
+
+	return NULL;
 }
 
 /* Drag in objects via register_usb_bus() */

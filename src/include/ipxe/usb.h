@@ -249,6 +249,9 @@ struct usb_endpoint_descriptor {
 /** Endpoint attribute transfer type mask */
 #define USB_ENDPOINT_ATTR_TYPE_MASK 0x03
 
+/** Endpoint periodic type */
+#define USB_ENDPOINT_ATTR_PERIODIC 0x01
+
 /** Control endpoint transfer type */
 #define USB_ENDPOINT_ATTR_CONTROL 0x00
 
@@ -380,10 +383,11 @@ struct usb_endpoint {
 
 	/** Endpoint is open */
 	int open;
-	/** Current failure state (if any) */
-	int rc;
 	/** Buffer fill level */
 	unsigned int fill;
+
+	/** List of halted endpoints */
+	struct list_head halted;
 
 	/** Host controller operations */
 	struct usb_endpoint_host_operations *host;
@@ -754,7 +758,7 @@ struct usb_port {
 	 */
 	struct usb_device *usb;
 	/** List of changed ports */
-	struct list_head list;
+	struct list_head changed;
 };
 
 /** A USB hub */
@@ -819,6 +823,15 @@ struct usb_hub_driver_operations {
 	 * @ret rc		Return status code
 	 */
 	int ( * speed ) ( struct usb_hub *hub, struct usb_port *port );
+	/** Clear transaction translator buffer
+	 *
+	 * @v hub		USB hub
+	 * @v port		USB port
+	 * @v ep		USB endpoint
+	 * @ret rc		Return status code
+	 */
+	int ( * clear_tt ) ( struct usb_hub *hub, struct usb_port *port,
+			     struct usb_endpoint *ep );
 };
 
 /**
@@ -888,6 +901,8 @@ struct usb_bus {
 	struct list_head hubs;
 	/** List of changed ports */
 	struct list_head changed;
+	/** List of halted endpoints */
+	struct list_head halted;
 	/** Process */
 	struct process process;
 
@@ -1177,6 +1192,7 @@ extern void usb_free_address ( struct usb_bus *bus, unsigned int address );
 extern unsigned int usb_route_string ( struct usb_device *usb );
 extern unsigned int usb_depth ( struct usb_device *usb );
 extern struct usb_port * usb_root_hub_port ( struct usb_device *usb );
+extern struct usb_port * usb_transaction_translator ( struct usb_device *usb );
 
 /** Minimum reset time
  *

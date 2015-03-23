@@ -2437,6 +2437,9 @@ static int xhci_endpoint_reset ( struct usb_endpoint *ep ) {
 	if ( ( rc = xhci_set_tr_dequeue_pointer ( xhci, slot, endpoint ) ) != 0)
 		return rc;
 
+	/* Ring doorbell to resume processing */
+	xhci_doorbell ( &endpoint->ring );
+
 	DBGC ( xhci, "XHCI %p slot %d ctx %d reset\n",
 	       xhci, slot->id, endpoint->ctx );
 	return 0;
@@ -2989,6 +2992,25 @@ static int xhci_hub_speed ( struct usb_hub *hub, struct usb_port *port ) {
 	return 0;
 }
 
+/**
+ * Clear transaction translator buffer
+ *
+ * @v hub		USB hub
+ * @v port		USB port
+ * @v ep		USB endpoint
+ * @ret rc		Return status code
+ */
+static int xhci_hub_clear_tt ( struct usb_hub *hub, struct usb_port *port,
+			       struct usb_endpoint *ep ) {
+	struct ehci_device *ehci = usb_hub_get_drvdata ( hub );
+
+	/* Should never be called; this is a root hub */
+	DBGC ( ehci, "XHCI %p port %d nonsensical CLEAR_TT for %s endpoint "
+	       "%02x\n", ehci, port->address, ep->usb->name, ep->address );
+
+	return -ENOTSUP;
+}
+
 /******************************************************************************
  *
  * PCI interface
@@ -3022,6 +3044,7 @@ static struct usb_host_operations xhci_operations = {
 		.enable = xhci_hub_enable,
 		.disable = xhci_hub_disable,
 		.speed = xhci_hub_speed,
+		.clear_tt = xhci_hub_clear_tt,
 	},
 };
 
